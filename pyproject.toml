@@ -1,0 +1,8 @@
+[project]
+name = "task-management"
+version = "0.1.0"
+description = "A task management API built with FastAPI (learning project)"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.162.5",
+]

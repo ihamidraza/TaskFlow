@@ -1,0 +1,138 @@
+# Learning Log: Task Management API
+
+A running journal of what was built and why. Newest lessons go at the bottom.
+
+---
+
+## Lesson 1: Setting up FastAPI
+
+### Run it
+
+```bash
+uv run fastapi dev app/main.py
+```
+
+Then open:
+- http://127.0.0.1:8000/docs : interactive docs (Swagger UI). You can call every endpoint from here.
+- http://127.0.0.1:8000/redoc : the same docs, different style.
+
+`fastapi dev` auto-reloads when you save a file. For production you'd use `fastapi run` instead.
+
+### 1. The tools
+
+| Tool | What it is |
+|------|------------|
+| **uv** | A fast Python project manager. It installs Python, creates the virtual environment and installs packages. It replaces `pip` + `venv` + `pyenv`. |
+| **FastAPI** | The web framework. You write Python functions; it turns them into HTTP endpoints. |
+| **Pydantic** | Data validation library FastAPI is built on. You describe data with classes; it checks incoming data matches. |
+| **Uvicorn** | The actual web server (ASGI server) that runs your FastAPI app. `fastapi dev` starts it for you. |
+
+`fastapi[standard]` installs FastAPI plus the "standard" extras: uvicorn, the `fastapi` CLI, and a few helpers.
+
+### 2. Commands that were run
+
+```bash
+uv init --app --python 3.13 .     # create pyproject.toml, .python-version, .gitignore, git repo
+uv add "fastapi[standard]"        # install FastAPI and record it in pyproject.toml + uv.lock
+```
+
+What each generated file does:
+
+- **`pyproject.toml`**: the project's ID card. Name, Python version, and the dependency list. You edit this (or let `uv add` edit it).
+- **`uv.lock`**: the *exact* version of every package (including sub-dependencies). Guarantees everyone gets identical installs. Commit it, never edit it by hand.
+- **`.python-version`**: tells uv which Python to use (3.13 here, picked over 3.15 because it's well supported by all libraries).
+- **`.venv/`**: the **virtual environment**: a private folder of packages just for this project, so projects don't conflict with each other. Not committed to git.
+
+`uv run <command>` runs a command *inside* the virtual environment, so you never need to "activate" it. (You still can: `source .venv/bin/activate`.)
+
+### 3. Project structure
+
+```
+task-management/
+├── app/
+│   ├── __init__.py        # empty; marks `app` as a Python package so `from app...` imports work
+│   ├── main.py            # creates the FastAPI app and plugs in routers
+│   ├── schemas.py         # Pydantic models: the shape of request/response data
+│   └── routers/
+│       ├── __init__.py
+│       └── tasks.py       # all /tasks endpoints
+├── pyproject.toml
+└── uv.lock
+```
+
+Why split files? Each file has one job. As the project grows (users, projects, auth...) each gets its own router and schemas, and `main.py` stays tiny.
+
+### 4. Key concepts in the code
+
+**Path operation**: method + path + function:
+```python
+@app.get("/health")
+def health():
+    return {"status": "ok"}   # dicts/models are turned into JSON automatically
+```
+
+**Where does a parameter come from?** FastAPI decides from the function signature:
+
+| Looks like | It's a... | Example |
+|---|---|---|
+| name appears in the path `{task_id}` | **path** parameter | `GET /tasks/5` |
+| simple type (`int`, `bool`, `str`) not in path | **query** parameter | `GET /tasks?completed=true` |
+| Pydantic model | **request body** (JSON) | `POST /tasks` with `{"title": "..."}` |
+
+**Type hints = validation.** `task_id: int` means `/tasks/abc` is automatically rejected with **422**. `Field(min_length=1)` means an empty title is rejected. You write zero validation code.
+
+**Separate schemas for input and output.** `TaskCreate` (no `id`, client sends it), `TaskUpdate` (all optional, for PATCH), `Task` (has `id`, server returns it). The client should never pick the id.
+
+**Routers**: `APIRouter(prefix="/tasks")` groups related endpoints; `app.include_router(...)` mounts them.
+
+**Errors**: `raise HTTPException(status_code=404, detail="Task not found")`.
+
+### 5. HTTP status codes used
+
+| Code | Meaning | When |
+|---|---|---|
+| 200 | OK | successful GET / PATCH |
+| 201 | Created | successful POST |
+| 204 | No Content | successful DELETE (empty body) |
+| 404 | Not Found | task id doesn't exist |
+| 422 | Unprocessable Content | request data failed validation (FastAPI does this for you) |
+
+### 6. Try it yourself
+
+```bash
+curl -X POST localhost:8000/tasks -H 'Content-Type: application/json' -d '{"title":"Learn FastAPI"}'
+curl localhost:8000/tasks
+curl -X PATCH localhost:8000/tasks/1 -H 'Content-Type: application/json' -d '{"completed":true}'
+curl -X DELETE localhost:8000/tasks/1
+```
+
+Or just use `/docs`, which is easier. Then restart the server and notice the tasks are gone: that's because storage is an in-memory dict.
+
+### Exercises
+
+1. Add a `priority` field (`"low" | "medium" | "high"`, default `"medium"`). Hint: `Literal` from `typing`.
+2. Add a `GET /tasks?search=word` filter that matches titles.
+3. Send `{"title": 123}` to `POST /tasks`. What happens and why?
+
+### Next lessons (suggested order)
+
+1. Real database (SQLite + SQLModel) so data survives restarts
+2. Tests with `pytest` + FastAPI's `TestClient`
+3. Dependency injection (`Depends`), the FastAPI superpower
+4. Users and authentication (JWT)
+
+---
+
+## Lesson 2: Pushing to GitHub
+
+`uv init` already ran `git init`, so the folder was a git repo with no commits yet.
+
+```bash
+git add -A                         # stage every file (respecting .gitignore)
+git commit -m "Initial FastAPI setup"
+git remote add origin git@github.com:ihamidraza/TaskFlow.git
+git push -u origin main            # -u remembers origin/main, so later just `git push`
+```
+
+What's NOT pushed, thanks to `.gitignore`: `.venv/` (anyone can recreate it with `uv sync`) and `__pycache__/` (compiled Python bytecode).
+What IS pushed and matters: `uv.lock`, so a teammate running `uv sync` gets the exact same package versions.
