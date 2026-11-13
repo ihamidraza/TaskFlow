@@ -1,33 +1,66 @@
-"""Entry point of the API.
+"""Application entry point.
 
-`fastapi dev app/main.py` looks in this file for a variable named `app`
-and serves it. Everything else (routes, schemas) is plugged into it here.
+`fastapi dev app/main.py` imports this file and serves the variable `app`.
 """
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.routers import tasks
-
-# The FastAPI object IS your application. The title/description show up
-# in the auto-generated docs at /docs.
-app = FastAPI(
-    title="Task Management API",
-    description="A learning project for FastAPI.",
-    version="0.1.0",
-)
-
-# A router is a mini-app holding a group of related routes.
-# include_router() mounts all of its routes onto the main app.
-app.include_router(tasks.router)
+from app.api.v1.router import api_router
+from app.core.config import Settings, get_settings
+from app.core.logging import configure_logging
+from app.db.session import create_engine, create_sessionmaker
+from app.middleware.request_logging import log_requests
+from app.modules.health.router import router as health_router
 
 
-# A "path operation": HTTP method (GET) + path ("/") + the function that handles it.
-# Whatever you return is converted to JSON automatically.
-@app.get("/")
-def root() -> dict[str, str]:
-    return {"message": "Task Management API is running. Visit /docs"}
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Startup and shutdown in one function.
+
+    Code before `yield` runs once at startup; code after runs once at shutdown.
+    NestJS comparison: `onModuleInit` + `onApplicationShutdown` in one place.
+
+    Creating the engine doesn't connect yet; connections open lazily on first
+    use. No `create_all()` here: Alembic migrations own the schema.
+    """
+    settings: Settings = app.state.settings
+    engine = create_engine(str(settings.database_url))
+    app.state.engine = engine
+    app.state.sessionmaker = create_sessionmaker(engine)
+    try:
+        yield
+    finally:
+        # Close every pooled connection cleanly.
+        await engine.dispose()
 
 
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def create_app(settings: Settings | None = None) -> FastAPI:
+    """App factory: builds a fresh, configured FastAPI app.
+
+    Tests call `create_app(test_settings)` to get an app pointed at the test
+    database, without touching environment variables.
+    """
+    # Fail fast: invalid or missing config raises a ValidationError right here,
+    # before the server accepts any request.
+    settings = settings or get_settings()
+    configure_logging(settings.log_level)
+
+    app = FastAPI(
+        title=settings.app_name,
+        version="0.1.0",
+        debug=settings.debug,
+        lifespan=lifespan,
+    )
+    app.state.settings = settings
+
+    app.middleware("http")(log_requests)
+
+    app.include_router(health_router)
+    app.include_router(api_router)
+    return app
+
+
+app = create_app()

@@ -68,7 +68,7 @@ Why split files? Each file has one job. As the project grows (users, projects, a
 ```python
 @app.get("/health")
 def health():
-    return {"status": "ok"}   # dicts/models are turned into JSON automatically
+    return {"status": "ok"}  # dicts/models are turned into JSON automatically
 ```
 
 **Where does a parameter come from?** FastAPI decides from the function signature:
@@ -136,3 +136,131 @@ git push -u origin main            # -u remembers origin/main, so later just `gi
 
 What's NOT pushed, thanks to `.gitignore`: `.venv/` (anyone can recreate it with `uv sync`) and `__pycache__/` (compiled Python bytecode).
 What IS pushed and matters: `uv.lock`, so a teammate running `uv sync` gets the exact same package versions.
+
+---
+
+## Lesson 3: Phase 1, Foundation
+
+> The in-memory tasks code from Lesson 1 was removed. Tasks return in Phase 5,
+> backed by PostgreSQL. It's still in git history (`git show 7a3321a`).
+
+### What exists now
+
+| File | Job | NestJS equivalent |
+|---|---|---|
+| `app/core/config.py` | Typed settings from env / `.env` | `ConfigModule` + Joi schema |
+| `app/core/logging.py` | JSON log formatter | a custom `LoggerService` |
+| `app/db/base.py` | `Base` class every model inherits | TypeORM entity base |
+| `app/db/session.py` | Engine, session factory, `get_db()` | `DataSource` + request-scoped provider |
+| `app/middleware/request_logging.py` | One log line per request | `LoggingInterceptor` |
+| `app/modules/health/router.py` | `/health/live`, `/health/ready` | `@nestjs/terminus` |
+| `app/api/v1/router.py` | Collects all `/api/v1` routers | `RouterModule` |
+| `app/main.py` | App factory + lifespan | `main.ts` + `AppModule` |
+| `alembic/` | Database migrations | TypeORM migrations |
+| `compose.yaml` | PostgreSQL 17 (+ `taskflow_test` db) | same |
+
+### Concept 1: pydantic-settings and failing fast
+
+```python
+class Settings(BaseSettings):
+    database_url: PostgresDsn   # no default = required
+    jwt_secret: SecretStr       # masked in logs as **********
+```
+Env vars map to fields by name. Types are converted (`"15"` -> `15`) and validated.
+A missing `DATABASE_URL` crashes at **startup** with a clear error instead of
+failing on the first request at 3 a.m. `@lru_cache` on `get_settings()` makes it a
+lazy singleton.
+
+### Concept 2: Dependency injection with `Depends` and `yield`
+
+```python
+async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
+    async with sessionmaker() as session:
+        yield session          # injected into the endpoint
+    # session closed here, after the response
+
+async def ready(db: Annotated[AsyncSession, Depends(get_db)]): ...
+```
+Big difference from NestJS: there's no DI container or `@Injectable()`. FastAPI reads
+the endpoint's parameters, sees `Depends(get_db)`, calls it, and injects the result.
+Dependencies are plain functions, can depend on other dependencies, and are swapped
+in tests with `app.dependency_overrides[get_db] = fake_get_db`.
+
+### Concept 3: Engine vs session
+
+- **Engine**: one per app. Holds the connection **pool** (5 kept open, up to 10 extra).
+- **AsyncSession**: one per request. A unit of work: tracks objects, owns a transaction.
+  **Never share a session between concurrent requests.**
+
+`pool_pre_ping=True` is why `/health/ready` recovered by itself after Postgres
+restarted: dead connections are detected and replaced.
+
+### Concept 4: Lifespan
+
+```python
+@asynccontextmanager
+async def lifespan(app):
+    engine = create_engine(...)   # startup
+    yield                         # app serves requests
+    await engine.dispose()        # shutdown
+```
+Startup and shutdown live in one function, so whatever you open you close right
+next to it. Replaces the deprecated `@app.on_event("startup")`.
+
+### Concept 5: async and `await`
+
+`async def` endpoints run on one event loop (like Node). `await db.execute(...)`
+yields control while Postgres works, so other requests proceed. **Rule:** never call
+blocking I/O (`requests.get`, `time.sleep`, sync DB drivers) inside `async def`;
+it freezes every request. That's why the driver is `asyncpg`. Ruff's `ASYNC`
+rules catch some of these mistakes.
+
+`asyncio.timeout(2)` in the readiness check bounds the wait, the same idea as
+`Promise.race` with a timer.
+
+### Concept 6: Liveness vs readiness
+
+- `/live`: is the process alive? Fails -> orchestrator **restarts** the container.
+- `/ready`: can it serve traffic? Fails -> load balancer **stops routing** to it.
+If `/live` checked the DB, a database blip would restart every API container for no reason.
+
+### Concept 7: Alembic
+
+`env.py` reads `DATABASE_URL` from `Settings` (no credentials in `alembic.ini`)
+and points at `Base.metadata`. In Phase 2, `alembic revision --autogenerate` will
+diff the models against the database and write a migration you **review** before
+applying with `alembic upgrade head`.
+
+The naming convention in `base.py` gives constraints predictable names like
+`uq_users_email`, so later migrations can find and alter them.
+
+### Concept 8: Testing
+
+- `create_app(settings)` (the app factory) builds an app pointed at `taskflow_test`.
+- `httpx.AsyncClient(transport=ASGITransport(app))` calls the app in-process, like supertest.
+- Gotcha: `ASGITransport` doesn't run the lifespan, so `conftest.py` runs it with
+  `app.router.lifespan_context(app)`.
+- Fixtures are injected by **parameter name**: `async def test_x(client): ...`
+
+### Gotcha we hit: macOS privacy and Docker bind mounts
+
+Postgres couldn't read a mounted `./docker/postgres` folder. macOS blocks OrbStack
+from reading `~/Desktop`. Fix: put the init SQL inline in `compose.yaml` using
+`configs: content:`, so nothing is mounted.
+
+### Commands
+
+```bash
+docker compose up -d                 # start Postgres
+uv run fastapi dev app/main.py       # run API with reload
+uv run pytest                        # tests
+uv run ruff format . && uv run ruff check .   # format + lint
+uv run mypy app tests alembic/env.py          # type check
+uv run alembic current               # check migration state
+```
+
+### Exercises
+
+1. Add `"db": "ok"` to the `/health/ready` response. Where do you change the model, and does `/docs` update?
+2. Set `APP_ENV=production` and `DEBUG=true` in `.env`, then start the server. What happens?
+3. Temporarily put `time.sleep(3)` in `/health/live`, then call `/health/ready` at the same time from another terminal. What happens to it? Then try `await asyncio.sleep(3)`.

@@ -1,0 +1,35 @@
+# Development services. Phase 1 runs only PostgreSQL; the API runs on your
+# machine with `uv run fastapi dev`. An API container is added in Phase 6.
+services:
+  db:
+    image: postgres:17
+    environment:
+      # Dev-only credentials. Real deployments inject these from a secret store.
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: taskflow_dev
+      POSTGRES_DB: taskflow
+    ports:
+      - "5432:5432"
+    volumes:
+      # Named volume: data survives `docker compose down` (but not `down -v`).
+      - postgres_data:/var/lib/postgresql/data
+    configs:
+      # Files in /docker-entrypoint-initdb.d run once, when the volume is first created.
+      - source: create_test_db
+        target: /docker-entrypoint-initdb.d/01-create-test-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow -d taskflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+configs:
+  # Inline file content (no bind mount, so it works even when Docker can't read
+  # the project folder, e.g. macOS privacy rules on ~/Desktop).
+  create_test_db:
+    content: |
+      -- A separate database for automated tests, so tests never touch dev data.
+      CREATE DATABASE taskflow_test OWNER taskflow;
+
+volumes:
+  postgres_data:
