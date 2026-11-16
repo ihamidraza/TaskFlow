@@ -163,8 +163,8 @@ What IS pushed and matters: `uv.lock`, so a teammate running `uv sync` gets the 
 
 ```python
 class Settings(BaseSettings):
-    database_url: PostgresDsn   # no default = required
-    jwt_secret: SecretStr       # masked in logs as **********
+    database_url: PostgresDsn  # no default = required
+    jwt_secret: SecretStr  # masked in logs as **********
 ```
 Env vars map to fields by name. Types are converted (`"15"` -> `15`) and validated.
 A missing `DATABASE_URL` crashes at **startup** with a clear error instead of
@@ -176,8 +176,9 @@ lazy singleton.
 ```python
 async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
     async with sessionmaker() as session:
-        yield session          # injected into the endpoint
+        yield session  # injected into the endpoint
     # session closed here, after the response
+
 
 async def ready(db: Annotated[AsyncSession, Depends(get_db)]): ...
 ```
@@ -200,9 +201,9 @@ restarted: dead connections are detected and replaced.
 ```python
 @asynccontextmanager
 async def lifespan(app):
-    engine = create_engine(...)   # startup
-    yield                         # app serves requests
-    await engine.dispose()        # shutdown
+    engine = create_engine(...)  # startup
+    yield  # app serves requests
+    await engine.dispose()  # shutdown
 ```
 Startup and shutdown live in one function, so whatever you open you close right
 next to it. Replaces the deprecated `@app.on_event("startup")`.
@@ -264,3 +265,146 @@ uv run alembic current               # check migration state
 1. Add `"db": "ok"` to the `/health/ready` response. Where do you change the model, and does `/docs` update?
 2. Set `APP_ENV=production` and `DEBUG=true` in `.env`, then start the server. What happens?
 3. Temporarily put `time.sleep(3)` in `/health/live`, then call `/health/ready` at the same time from another terminal. What happens to it? Then try `await asyncio.sleep(3)`.
+
+---
+
+## Lesson 4: Phase 2, Database Models
+
+### What exists now
+
+| File | Job | TypeORM equivalent |
+|---|---|---|
+| `app/db/mixins.py` | Shared `id` + `created_at`/`updated_at` | abstract `BaseEntity` |
+| `app/db/types.py` | `str_enum()`: enum stored as VARCHAR + CHECK | `@Column({ type: 'enum' })` |
+| `app/db/models.py` | Imports every model (the registry) | `entities: [...]` |
+| `app/modules/users/model.py` | `User` | `@Entity() class User` |
+| `app/modules/projects/model.py` | `Project`, `ProjectMember`, `ProjectRole` | |
+| `app/modules/tasks/model.py` | `Task`, `TaskStatus`, `TaskPriority` | |
+| `alembic/versions/…_initial_schema.py` | The migration, reviewed by hand | generated migration |
+| `tests/factories.py` | Helpers that create valid rows | test fixtures/builders |
+
+### Concept 1: `Mapped[...]` is the type AND the column
+
+```python
+name: Mapped[str] = mapped_column(String(100))           # NOT NULL
+description: Mapped[str | None] = mapped_column(Text)     # NULL allowed
+owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+```
+SQLAlchemy 2.x reads the type hint: `str | None` means nullable, `str` means NOT NULL,
+`uuid.UUID` means a Postgres `UUID` column. mypy understands it with no plugin.
+TypeORM needs both `@Column({ nullable: true })` and `string | null`; here one line does both.
+
+### Concept 2: Relationships in async code (`lazy="raise"`)
+
+```python
+project: Mapped["Project"] = relationship(back_populates="tasks", lazy="raise")
+```
+- `back_populates` links both sides (`task.project` and `project.tasks`).
+- `"Project"` is a **string**: the class lives in another module, and importing it
+  would be circular. `if TYPE_CHECKING:` imports exist only for mypy.
+- **Lazy loading doesn't work in async.** Sync SQLAlchemy runs a hidden query when you
+  touch `task.project`; async can't (there's no `await`), and crashes with a
+  confusing `MissingGreenlet` error. `lazy="raise"` makes it a clear error instead, and you
+  load what you need explicitly:
+  ```python
+  await session.scalar(select(Task).options(selectinload(Task.project)))
+  ```
+  TypeORM comparison: like always passing `relations: [...]`, enforced.
+
+### Concept 3: Choosing what happens on delete
+
+| FK | ON DELETE | Why |
+|---|---|---|
+| members/tasks → project | CASCADE | Deleting a project removes them in the same statement |
+| task.assignee_id → user | SET NULL | Task survives, unassigned |
+| owner_id, created_by, member.user_id → user | RESTRICT | Users are deactivated, never deleted |
+
+On the ORM side, `passive_deletes=True` means "don't load the children to delete them one by
+one; the database cascades". Without it, `session.delete(project)` would SELECT every task first.
+
+### Concept 4: Constraints the database enforces for you
+
+- **Expression index:** `CREATE UNIQUE INDEX … ON users (lower(email))`, so uniqueness ignores case.
+- **Partial index:** `CREATE UNIQUE INDEX … ON project_members (project_id) WHERE role = 'owner'`.
+  Only owner rows are indexed, so there can be at most one per project. Consequence for
+  Phase 4: ownership transfer must demote the old owner **before** promoting the new one.
+- **CHECK:** `(status = 'done') = (completed_at IS NOT NULL)`. Compares two booleans:
+  both true or both false.
+- **Why bother, if Pydantic validates?** The API is one entry point. Scripts, migrations,
+  future services and bugs are others. The database is the last line of defense.
+
+### Concept 5: Enums: values vs names, VARCHAR vs native
+
+```python
+class TaskStatus(StrEnum):
+    IN_PROGRESS = "in_progress"     # StrEnum members ARE strings
+```
+- SQLAlchemy stores the **name** (`IN_PROGRESS`) by default; `values_callable` makes it
+  store the **value** (`in_progress`), which matches the API contract.
+- `native_enum=False` gives `VARCHAR(32)` + `CHECK (status IN (...))` instead of a Postgres
+  `ENUM` type, which is hard to change later (no easy remove/rename of values).
+
+### Concept 6: When does a default run?
+
+```python
+user = User(name="Ada", email="a@x.com", password_hash="…")
+user.id         # None! Column defaults don't run in __init__
+await session.flush()
+user.id         # UUID: generated when the INSERT was sent, still before commit
+```
+**flush** = send pending SQL to the database inside the current transaction.
+**commit** = make the transaction permanent. You can flush many times before one commit.
+
+`eager_defaults=True` (in `TimestampMixin`) uses `INSERT/UPDATE … RETURNING` to read back
+database-generated values like `updated_at`, so reading them later needs no hidden query.
+
+### Concept 7: Reviewing an autogenerated migration
+
+`alembic revision --autogenerate` diffs `Base.metadata` against the database. **Always read
+the output.** It can't detect everything (renames look like drop + add, which **loses data**;
+some CHECK constraint changes are invisible). Our review checked names, ON DELETE rules, the
+expression and partial indexes, and the downgrade order. The notes are at the top of the file.
+
+Then: `downgrade base` → `upgrade head` (round trip), and `alembic check` (no drift).
+`tests/integration/test_migrations.py` runs `alembic check` in every test run.
+
+### Concept 8: Rollback-per-test isolation
+
+```python
+async with engine.connect() as connection:
+    transaction = await connection.begin()
+    session = AsyncSession(bind=connection, join_transaction_mode="create_savepoint")
+    yield session
+    await transaction.rollback()
+```
+Every test writes real rows to real Postgres, then everything is undone. Even a
+`session.commit()` inside the code under test only commits a **savepoint**. After a full run
+the test database has 0 rows. The `app` fixture also overrides `get_db` to hand out this
+session: that's FastAPI's `dependency_overrides`, used heavily from Phase 3 on.
+
+### Gotchas we hit
+
+1. **Name clash:** `import app.db.models` in `main.py` binds the name `app` (the package),
+   which `app = create_app()` then overwrote. mypy caught it. Fix: `from app.db import models`.
+2. **Ruff thought `alembic` was our package** because of the `alembic/` folder, so it sorted
+   imports wrongly. Fix: `known-third-party = ["alembic"]`.
+3. **Migration template:** updated `alembic/script.py.mako` to modern typing
+   (`str | None` instead of `Union`), so future migrations pass Ruff as generated.
+
+### Commands
+
+```bash
+uv run alembic upgrade head          # apply migrations
+uv run alembic downgrade base        # undo all (DESTROYS data)
+uv run alembic check                 # models vs migrations drift check
+docker compose exec db psql -U taskflow -d taskflow -c '\d tasks'   # inspect a table
+```
+
+### Exercises
+
+1. Run `\d project_members` in psql. Find the partial index and its `WHERE`.
+2. In psql, try `INSERT INTO users (name, email, password_hash) VALUES ('A','A@X.COM','x')` twice
+   with different capitalisation. Which constraint fires?
+3. Add a nullable `color: Mapped[str | None]` column to `Project`, run
+   `alembic revision --autogenerate -m "project color"`, read the file, `upgrade head`, then
+   `downgrade -1` and delete the file. (Practice only; don't commit it.)

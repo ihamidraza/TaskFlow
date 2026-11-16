@@ -1,17 +1,13 @@
 import asyncio
 from logging.config import fileConfig
 
+from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from alembic import context
 from app.core.config import get_settings
-from app.db.base import Base
-
-# Import every module that defines models here so their tables register on
-# Base.metadata before autogenerate compares it to the database (Phase 2).
-# import app.modules.users.model  # noqa: F401
+from app.db.models import Base  # importing the registry registers every table
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -20,11 +16,15 @@ config = context.config
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False: don't silence the app's loggers when
+    # migrations run inside the test suite.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
-# Use the same DATABASE_URL as the app. ('%' is escaped because the .ini
-# config parser treats it as an interpolation character.)
-config.set_main_option("sqlalchemy.url", str(get_settings().database_url).replace("%", "%%"))
+# Use the same DATABASE_URL as the app, unless the caller already set a URL
+# (the test suite does, to migrate the test database). '%' is escaped because
+# the .ini config parser treats it as an interpolation character.
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", str(get_settings().database_url).replace("%", "%%"))
 
 # The metadata autogenerate compares against the live database.
 target_metadata = Base.metadata

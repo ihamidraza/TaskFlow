@@ -29,10 +29,18 @@ asyncio_default_fixture_loop_scope = "function"
 line-length = 100
 target-version = "py313"
 
+[tool.ruff.format]
+# Leave code samples in the Markdown lesson notes as written (aligned comments).
+exclude = ["*.md"]
+
 [tool.ruff.lint]
 # E/F: pycodestyle + pyflakes, I: import sorting, B: bugbear (likely bugs),
 # UP: modern syntax, ASYNC: async pitfalls (e.g. blocking calls in async code)
 select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.ruff.lint.isort]
+# The local alembic/ folder makes Ruff think "alembic" is our own package.
+known-third-party = ["alembic"]
 
 [tool.mypy]
 strict = true

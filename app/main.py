@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
+from app.db import models  # noqa: F401  (registers every model; see app/db/models.py)
 from app.db.session import create_engine, create_sessionmaker
 from app.middleware.request_logging import log_requests
 from app.modules.health.router import router as health_router
