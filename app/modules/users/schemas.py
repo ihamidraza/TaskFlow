@@ -59,6 +59,16 @@ class UserRead(BaseModel):
     created_at: datetime
 
 
+class UserSummary(BaseModel):
+    """Minimal public info about another user (e.g. inside a member list)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    email: str
+
+
 class UserUpdate(RequestModel):
     """PATCH body: send only the fields to change. An empty body is a no-op."""
 

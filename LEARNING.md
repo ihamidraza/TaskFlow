@@ -538,3 +538,155 @@ curl localhost:8000/api/v1/auth/me -H "Authorization: Bearer <token>"
    direct call. Run 5 concurrent logins and time `/health/live`. What changed?
 3. Remove `extra="forbid"` from `RequestModel` and run the tests. Which test fails, and what
    would that bug allow in production?
+
+---
+
+## Lesson 6: Phase 4, Projects and Membership
+
+### What exists now
+
+| File | Job |
+|---|---|
+| `app/core/pagination.py` | `PageParamsDep` (limit/offset) + generic `Page[T]` response |
+| `app/dependencies/permissions.py` | `ProjectMembership`: your membership in `{project_id}`, or 404 |
+| `app/modules/projects/permissions.py` | Who may attempt what: pure `role → bool` functions |
+| `app/modules/projects/repository.py` | Queries only: no commits, no permission checks |
+| `app/modules/projects/service.py` | Rules, permission enforcement, transactions, locking |
+| `app/modules/projects/router.py` | 10 thin routes; router-level auth dependency |
+
+### Concept 1: Three layers of "no"
+
+```
+CurrentUser         → 401  not logged in            (router-level dependency)
+ProjectMembership   → 404  not in this project      (dependency)
+service + can_*()   → 403  role not allowed         (service layer)
+service rule        → 400  nobody may do this       (e.g. remove the owner)
+```
+**Why 404 and not 403 for outsiders?** A 403 says "this project exists, you just can't
+see it". Returning the same 404 as a random UUID means guessing IDs reveals nothing. The
+test `test_outsider_gets_same_404_as_missing_project` compares the two bodies byte for byte.
+
+### Concept 2: Permissions as pure functions
+
+```python
+def can_add_member(actor: ProjectRole, new_role: ProjectRole) -> bool:
+    if actor is OWNER: return True
+    if actor is ADMIN: return new_role is MEMBER
+    return False
+```
+No database, no FastAPI, so the spec's authorization table becomes a parametrized unit
+test with one case per cell (`tests/unit/test_project_permissions.py`). NestJS comparison:
+like CASL ability rules, without the library.
+
+### Concept 3: Router-level dependencies
+
+```python
+router = APIRouter(prefix="/projects", dependencies=[Depends(get_current_user)])
+```
+Every route on the router requires a token, even one that forgets to declare
+`CurrentUser`. Routes that need the user object still declare it, and FastAPI's per-request
+cache means `get_current_user` runs once.
+
+### Concept 4: One transaction, several tables
+
+```python
+session.add(project)
+await session.flush()          # INSERT project → project.id exists (not yet permanent)
+repository.add_membership(...) # INSERT owner membership
+await session.commit()         # both rows become permanent together
+```
+If anything raises before `commit`, nothing is saved: `get_db` closes the session, which
+rolls back. `test_create_project_is_atomic` makes the second INSERT fail on purpose and
+checks the project row is gone.
+
+### Concept 5: Race conditions and `SELECT … FOR UPDATE`
+
+Every membership change starts with:
+```python
+await repository.lock_project(session, project_id)   # SELECT ... FOR UPDATE
+actor = await repository.get_membership(..., refresh=True)   # re-read MY role under the lock
+```
+- `FOR UPDATE` locks the project row; a second transaction touching the same project
+  **waits** until the first commits. Changes to one project's members happen one at a time.
+- **Re-reading under the lock matters.** Your membership was loaded at the start of the
+  request, possibly before someone else's change committed.
+- `populate_existing=True`: the session caches objects by primary key (the "identity map");
+  without this, a re-query hands back the cached, stale object.
+
+**We watched it work** on the dev server. Two transfers were sent at the same moment (to bob
+and to cara). Bob's got the lock and committed. Cara's waited, re-read the owner's role
+(now `admin`) and got **403**. Result: exactly one owner, no 500s. Without the re-check, the
+second request would have acted on the stale `owner` role, and the one-owner index would
+have turned it into an `IntegrityError`, which surfaces as a 500.
+
+Lock order: everything locks the **project row first**. Taking locks in the same order
+everywhere is what prevents deadlocks.
+
+### Concept 6: Flush order isn't your code order
+
+```python
+actor.role = ProjectRole.ADMIN
+await session.flush()          # demotion hits the database FIRST
+target.role = ProjectRole.OWNER
+```
+The partial unique index allows one owner row per project, checked on every UPDATE.
+SQLAlchemy's unit of work doesn't promise to send UPDATEs in the order you assigned
+attributes, so the explicit `flush()` forces the demotion out first.
+
+### Concept 7: Generic models: `Page[T]`
+
+```python
+class Page[T](BaseModel):      # Python 3.12+ type parameter syntax
+    items: list[T]
+    pagination: PageMeta
+
+async def list_projects(...) -> Page[ProjectRead]: ...
+```
+Like `Page<T>` in TypeScript. Pydantic builds a concrete model per `T`; /docs shows
+`Page[ProjectRead]` and `Page[MemberRead]` separately.
+
+**Pagination rules from the spec:** the authorization filter is *inside* the query, so
+`total` never counts projects you can't see. The sort is deterministic (`created_at DESC,
+id DESC`): with only `created_at`, two rows with equal timestamps could swap between pages.
+
+### Concept 8: Nested schemas and N+1 queries
+
+```python
+class MemberRead(BaseModel):
+    user: UserSummary     # nested model
+    role: ProjectRole
+```
+`MemberRead.model_validate(member)` reads `member.user` automatically, but only if it was
+loaded. `selectinload(ProjectMember.user)` loads the users for the whole page in **one** extra
+query (`WHERE id IN (...)`). Loading them one per member would be the classic **N+1
+problem**: 1 query for the list + N for the users. (`lazy="raise"` makes that mistake
+impossible to miss.)
+
+### Concept 9: Faster tests with minted tokens
+
+The `team` fixture (tests/integration/conftest.py) creates an owner, admin, member and
+outsider directly in the database and signs tokens with `create_access_token`, skipping
+HTTP login and its ~30 ms Argon2 check per user. Login itself is still tested in
+`test_auth.py`. 139 tests run in about 6 seconds.
+
+### Commands
+
+```bash
+TOKEN=...   # from /auth/login
+curl -X POST localhost:8000/api/v1/projects -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name":"My project"}'
+curl "localhost:8000/api/v1/projects?limit=10&offset=0" -H "Authorization: Bearer $TOKEN"
+curl -X POST localhost:8000/api/v1/projects/<id>/members -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"user_id":"<their id from /auth/me>","role":"member"}'
+```
+
+### Exercises
+
+1. In `service.transfer_ownership`, comment out the `await session.flush()` line and run
+   `tests/integration/test_ownership_transfer.py`. Does it still pass? Why might it pass
+   sometimes and still be wrong?
+2. Remove `refresh=True` in `_lock_and_recheck`, run the concurrent-transfer demo from this
+   lesson (two `curl … &` at once). What status codes do you get now?
+3. Add `?limit=2` to `GET /projects/{id}/members` and walk the pages with `offset`. Then add a
+   member between page 1 and page 2. What can go wrong with offset pagination, and what is
+   "keyset pagination"?

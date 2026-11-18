@@ -2,7 +2,7 @@
 
 A multi-user task and project management API built with FastAPI, PostgreSQL and async SQLAlchemy. It's a learning project: see [LEARNING.md](LEARNING.md) for lesson notes and [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for the full spec.
 
-**Status:** Phase 3 (Authentication) complete.
+**Status:** Phase 4 (Projects and membership) complete.
 
 ## Requirements
 
@@ -33,6 +33,15 @@ uv run fastapi dev app/main.py
 | GET | `/api/v1/auth/me` | bearer | Current user |
 | PATCH | `/api/v1/users/me` | bearer | Update name and/or email |
 | POST | `/api/v1/users/me/change-password` | bearer | Change password (204) |
+| POST | `/api/v1/projects` | bearer | Create a project; you become owner (201) |
+| GET | `/api/v1/projects` | bearer | Your projects, paginated (`?limit=&offset=`) |
+| GET / PATCH / DELETE | `/api/v1/projects/{id}` | member / owner+admin / owner | Read, update, delete |
+| GET / POST | `/api/v1/projects/{id}/members` | member / owner+admin | List members, add by `user_id` |
+| PATCH / DELETE | `/api/v1/projects/{id}/members/{user_id}` | owner / owner+admin | Change role, remove |
+| POST | `/api/v1/projects/{id}/transfer-ownership` | owner | Make a member the owner; you become admin |
+
+Projects you're not a member of return **404** (as if they don't exist). Members without
+the right role get **403**. Lists return `{"items": [...], "pagination": {...}}`.
 
 **Trying it in /docs:** register with `POST /auth/register`, click **Authorize**, enter your
 email as the username plus your password, then call any protected endpoint.
@@ -74,7 +83,7 @@ app/
 ├── core/                # config, logging
 ├── db/                  # Base, mixins, model registry, engine/session
 ├── middleware/          # request logging
-└── modules/             # feature modules: health, users, projects, tasks (models so far)
+└── modules/             # feature modules: health, auth, users, projects, tasks (model only)
 alembic/                 # migrations
 tests/                   # unit/ and integration/
 ```
