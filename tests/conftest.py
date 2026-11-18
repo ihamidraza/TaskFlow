@@ -42,7 +42,7 @@ def make_test_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "app_env": "testing",
         "database_url": TEST_DATABASE_URL,
-        "jwt_secret": "test-secret-not-for-production",
+        "jwt_secret": "test-secret-not-for-production-0123456789",
         "log_level": "WARNING",
     }
     values.update(overrides)

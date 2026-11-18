@@ -2,7 +2,7 @@
 
 A multi-user task and project management API built with FastAPI, PostgreSQL and async SQLAlchemy. It's a learning project: see [LEARNING.md](LEARNING.md) for lesson notes and [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md) for the full spec.
 
-**Status:** Phase 2 (Database models) complete.
+**Status:** Phase 3 (Authentication) complete.
 
 ## Requirements
 
@@ -22,6 +22,22 @@ uv run fastapi dev app/main.py
 - API docs: http://127.0.0.1:8000/docs (Swagger) and http://127.0.0.1:8000/redoc
 - Liveness: `GET /health/live`
 - Readiness (checks PostgreSQL): `GET /health/ready`
+
+## API (so far)
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/api/v1/auth/register` | none | Create an account (201) |
+| POST | `/api/v1/auth/login` | none | JSON login, returns a bearer token |
+| POST | `/api/v1/auth/token` | none | Same login as form data (used by the Authorize button in /docs) |
+| GET | `/api/v1/auth/me` | bearer | Current user |
+| PATCH | `/api/v1/users/me` | bearer | Update name and/or email |
+| POST | `/api/v1/users/me/change-password` | bearer | Change password (204) |
+
+**Trying it in /docs:** register with `POST /auth/register`, click **Authorize**, enter your
+email as the username plus your password, then call any protected endpoint.
+
+Errors use one format: `{"error": {"code": "...", "message": "...", "details": ...}}`.
 
 ## Development
 

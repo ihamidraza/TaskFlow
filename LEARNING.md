@@ -408,3 +408,133 @@ docker compose exec db psql -U taskflow -d taskflow -c '\d tasks'   # inspect a 
 3. Add a nullable `color: Mapped[str | None]` column to `Project`, run
    `alembic revision --autogenerate -m "project color"`, read the file, `upgrade head`, then
    `downgrade -1` and delete the file. (Practice only; don't commit it.)
+
+---
+
+## Lesson 5: Phase 3, Authentication
+
+### What exists now
+
+| File | Job | NestJS equivalent |
+|---|---|---|
+| `app/core/security.py` | Argon2 hashing, JWT create/decode | `bcrypt` + `@nestjs/jwt` `JwtService` |
+| `app/core/exceptions.py` | `AppError` classes + handlers → spec error format | custom exceptions + global `ExceptionFilter` |
+| `app/dependencies/auth.py` | `get_current_user`, `CurrentUser` | `JwtAuthGuard` + `@CurrentUser()` decorator |
+| `app/modules/auth/` | register, login, `/token`, `/me` | `AuthModule` |
+| `app/modules/users/` | schemas, service, `PATCH /me`, change password | `UsersModule` |
+
+### Concept 1: Dependencies replace guards
+
+```python
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+@router.get("/me")
+async def me(current_user: CurrentUser) -> UserRead: ...
+```
+Declaring the parameter **is** the protection. FastAPI runs `get_current_user` first; if it
+raises, the endpoint never runs. `get_current_user` itself depends on three other
+dependencies (the token, `DbSession`, `SettingsDep`): FastAPI resolves the whole tree, and
+caches each dependency once per request, so the session is shared.
+
+The `Annotated` aliases (`DbSession`, `SettingsDep`, `CurrentUser`) are reusable
+"type + how to get it" bundles. They're the closest thing to NestJS's `@Inject()`.
+
+### Concept 2: Services raise domain errors, not HTTP errors
+
+```python
+raise ConflictError("Email is already registered", code="EMAIL_ALREADY_REGISTERED")
+```
+One handler (`app_error_handler`) turns any `AppError` into the right status and body. The
+service never imports FastAPI, so it's reusable from a CLI or a background job, and easy to
+unit test. **Services are plain async functions** taking the session as their first
+argument: Python doesn't need a class + DI container to inject one dependency.
+
+### Concept 3: Hashing without blocking the event loop
+
+```python
+return await run_in_threadpool(_password_hash.hash, password)
+```
+Argon2 takes ~30 ms of pure CPU **on purpose**. Called directly in `async def`, it would
+freeze every request for 30 ms. `run_in_threadpool` runs it on a worker thread. We measured
+it: `/health/live` answered in 9 ms while 5 logins were hashing.
+(NestJS comparison: `bcrypt.hash()` vs `bcrypt.hashSync()`.)
+
+### Concept 4: JWT validation: what we check and why
+
+| Check | Stops |
+|---|---|
+| `algorithms=["HS256"]` allow-list | `alg: none` tokens with no signature |
+| Signature with our secret (≥ 32 chars, not the placeholder) | Forged or edited tokens |
+| `exp` | Stolen tokens being used forever |
+| `iss` + `aud` | Tokens minted for another service with a shared secret |
+| `require=[...]` | Tokens missing a claim (e.g. no `exp` = never expires) |
+| Reload user from DB, check `is_active` | Deactivated users with a still-valid token |
+
+The JWT payload is **signed, not encrypted**: anyone can base64-decode it. Never put secrets
+in it. Ours holds only the user id.
+
+### Concept 5: Not leaking information
+
+- **Same error for every login failure** (unknown email, wrong password, inactive account).
+- **Same timing too:** for an unknown email we still verify against a dummy hash. Measured:
+  ~31 ms for both cases. Without it, "unknown email" would answer in ~1 ms.
+- **422 responses don't echo input.** FastAPI's default body includes an `input` field, which
+  would copy a rejected password into the response. Our handler keeps only `loc`, `message`, `type`.
+- **`SecretStr` for passwords** in request models: `repr()` and logs show `**********`.
+- **`extra="forbid"`** on request models: `{"is_active": true}` is a 422, not silently ignored.
+
+### Concept 6: Pydantic types worth reusing
+
+```python
+NormalizedEmail = Annotated[EmailStr, BeforeValidator(_strip), AfterValidator(str.lower)]
+PersonName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+NewPassword = Annotated[SecretStr, Field(min_length=12, max_length=128)]
+```
+Before-validators run before type checking, after-validators after. `max_length=128` on
+passwords isn't a UX rule: it stops someone sending a 1 MB "password" to burn Argon2 CPU.
+
+**PATCH null vs omitted:** `{"name": null}` is rejected, `{}` changes nothing. A
+`field_validator` only runs for fields the client actually sent, which is what makes this work.
+
+### Concept 7: Why `/auth/token` exists alongside `/auth/login`
+
+The spec wants JSON login. Swagger's **Authorize** button speaks the OAuth2 password flow,
+which posts **form data** (`username`, `password`) to `tokenUrl`. `/auth/token` accepts that
+form and calls the same `authenticate()`, so /docs works end to end.
+
+### Concept 8: Registration race conditions
+
+```python
+if await get_user_by_email(...): raise ConflictError(...)   # friendly, common case
+session.add(user)
+try: await session.commit()
+except IntegrityError: ...                                    # two requests at once
+```
+Check-then-insert isn't atomic: two simultaneous requests can both pass the check. The
+unique index on `lower(email)` (Phase 2) lets only one win, and we turn the loser's
+`IntegrityError` into the same 409.
+
+### Known limits (by spec)
+
+- A password change doesn't invalidate existing tokens; they live until `exp` (max 30 min).
+- No rate limiting yet on login/register: Phase 6, before any public deployment.
+- `request_id` in error bodies: Phase 6.
+
+### Commands
+
+```bash
+curl -X POST localhost:8000/api/v1/auth/register -H 'Content-Type: application/json' \
+  -d '{"name":"Ada","email":"ada@example.com","password":"correct horse battery"}'
+curl -X POST localhost:8000/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"ada@example.com","password":"correct horse battery"}'
+curl localhost:8000/api/v1/auth/me -H "Authorization: Bearer <token>"
+```
+
+### Exercises
+
+1. Paste a token into https://jwt.io (it's a test token, so that's fine). Find `sub`, `exp`, `aud`.
+   What does that tell you about putting data in a JWT?
+2. In `security.py`, temporarily replace `run_in_threadpool(_password_hash.hash, ...)` with a
+   direct call. Run 5 concurrent logins and time `/health/live`. What changed?
+3. Remove `extra="forbid"` from `RequestModel` and run the tests. Which test fails, and what
+   would that bug allow in production?

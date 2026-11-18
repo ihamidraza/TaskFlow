@@ -11,8 +11,9 @@ a different database.
 """
 
 from collections.abc import AsyncIterator
+from typing import Annotated
 
-from fastapi import Request
+from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -51,3 +52,8 @@ async def get_db(request: Request) -> AsyncIterator[AsyncSession]:
     sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
     async with sessionmaker() as session:
         yield session
+
+
+# A reusable "type + how to get it" alias. Endpoints write `session: DbSession`
+# instead of repeating `Annotated[AsyncSession, Depends(get_db)]` everywhere.
+DbSession = Annotated[AsyncSession, Depends(get_db)]

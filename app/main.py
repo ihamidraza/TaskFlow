@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
+from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
 from app.db import models  # noqa: F401  (registers every model; see app/db/models.py)
 from app.db.session import create_engine, create_sessionmaker
@@ -58,6 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
 
     app.middleware("http")(log_requests)
+    register_exception_handlers(app)
 
     app.include_router(health_router)
     app.include_router(api_router)

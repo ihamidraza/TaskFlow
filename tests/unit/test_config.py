@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.core.config import Settings
+from app.core.config import PLACEHOLDER_JWT_SECRET, Settings
 from tests.conftest import make_test_settings
 
 
@@ -15,7 +15,7 @@ def test_missing_database_url_fails_fast(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_values_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@db:5432/x")
-    monkeypatch.setenv("JWT_SECRET", "s3cret")
+    monkeypatch.setenv("JWT_SECRET", "s" * 32)
     monkeypatch.setenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15")
 
     settings = Settings(_env_file=None)
@@ -25,10 +25,10 @@ def test_values_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_jwt_secret_is_masked() -> None:
-    settings = make_test_settings(jwt_secret="super-secret")
+    settings = make_test_settings(jwt_secret="super-secret-value-that-is-32-chars")
 
     assert "super-secret" not in repr(settings)
-    assert settings.jwt_secret.get_secret_value() == "super-secret"
+    assert settings.jwt_secret.get_secret_value() == "super-secret-value-that-is-32-chars"
 
 
 def test_debug_forbidden_in_production() -> None:
@@ -39,3 +39,13 @@ def test_debug_forbidden_in_production() -> None:
 def test_invalid_log_level_rejected() -> None:
     with pytest.raises(ValidationError):
         make_test_settings(log_level="LOUD")
+
+
+def test_short_jwt_secret_rejected() -> None:
+    with pytest.raises(ValidationError, match="jwt_secret"):
+        make_test_settings(jwt_secret="too-short")
+
+
+def test_placeholder_jwt_secret_rejected() -> None:
+    with pytest.raises(ValidationError, match="placeholder"):
+        make_test_settings(jwt_secret=PLACEHOLDER_JWT_SECRET)

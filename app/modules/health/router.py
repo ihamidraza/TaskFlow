@@ -8,14 +8,13 @@
 
 import asyncio
 import logging
-from typing import Annotated, Literal
+from typing import Literal
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Response, status
 from pydantic import BaseModel
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import get_db
+from app.db.session import DbSession
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +38,10 @@ async def live() -> HealthResponse:
     responses={503: {"model": HealthResponse, "description": "Database unreachable"}},
 )
 async def ready(
-    # `Annotated[type, Depends(fn)]`: "call get_db and inject what it yields".
-    # NestJS comparison: constructor injection, but per endpoint parameter.
-    db: Annotated[AsyncSession, Depends(get_db)],
+    # DbSession = Annotated[AsyncSession, Depends(get_db)]: "call get_db and
+    # inject what it yields". NestJS comparison: constructor injection, but per
+    # endpoint parameter.
+    db: DbSession,
     response: Response,
 ) -> HealthResponse:
     try:
